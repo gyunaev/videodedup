@@ -1,0 +1,10 @@
+sqlite3
+logging
+numpy
+cv2
+torch
+open_clip
+faiss
+dataclasses
+typing
+tqdm
