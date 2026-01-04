@@ -29,6 +29,9 @@ CLIP_MODEL_NAME = "ViT-B-32"
 CLIP_PRETRAINED = "laion2b_s34b_b79k"
 EMBED_DIM = 512  # hardcoded
 
+# HNSW does not allow removal of indexes so we use this as tombstone
+TOMBSTONE_VIDEO_ID = "/TOMBSTONE/"
+
 CONFIG = None
 STATE = None
 
@@ -186,14 +189,44 @@ class MetaDB:
         cur = self.conn.cursor()
         cur.execute("SELECT video_id, ts FROM frames WHERE frame_id = ?;", (int(frame_id),))
         row = cur.fetchone()
-        if row is None:
+        if not row:
             raise KeyError(frame_id)
-        return str(row[0]), float(row[1])
+
+        video_id, ts = row
+        if video_id == TOMBSTONE_VIDEO_ID:
+            raise KeyError(frame_id)
+
+        return video_id, ts
 
     def get_frames_for_video(self, video_id: str) -> List[Tuple[int, float]]:
         cur = self.conn.cursor()
         cur.execute("SELECT frame_id, ts FROM frames WHERE video_id = ? ORDER BY ts;", (video_id,))
         return [(int(r[0]), float(r[1])) for r in cur.fetchall()]
+
+    def removeMissingVideos( self, videos : List[str] ):
+        cur = self.conn.cursor()
+        cur.execute("SELECT * from videos")
+
+        existingids = []
+
+        for v in videos:
+            existingids.append( video_id_from_path( v ) )
+
+        for v in cur.fetchall():
+            if v[0] in existingids:
+                continue
+
+            print( f"Video {v[0]} removed" )
+
+            # Remove from the database
+            self.begin()
+            self.conn.execute(
+                "UPDATE frames SET video_id = ? WHERE video_id = ?;",
+                (TOMBSTONE_VIDEO_ID, v[0]),
+            )
+
+            self.conn.execute("DELETE FROM videos WHERE video_id = ?;", (v[0],))
+            self.commit()
 
     def close(self) -> None:
         self.conn.close()
@@ -383,12 +416,20 @@ def detect_duplicate_subclip(
     video_id: str,
     q_ts: List[float],
     q_emb: np.ndarray,
-    ) -> DuplicateDecision:
+) -> DuplicateDecision:
     if index.ntotal == 0:
         return DuplicateDecision(False, note="index_empty")
 
-    logging.debug("Duplicate detection: FAISS search (ntotal=%d, k=%d)", index.ntotal, CONFIG.knn_k)
-    D, I = index.search(q_emb, CONFIG.knn_k)  # I contains frame_ids from SQLite due to IDMap
+    # Oversample to compensate for tombstoned neighbors being filtered out.
+    k = CONFIG.knn_k
+    k_search = max(k * 5, 200)
+
+    logging.debug(
+        "Duplicate detection: FAISS search (ntotal=%d, k=%d, k_search=%d)",
+        index.ntotal, k, k_search
+    )
+
+    D, I = index.search(q_emb, k_search)  # I contains frame_ids (IDMap)
 
     votes: Dict[Tuple[str, int], int] = {}
     best_sim: Dict[Tuple[str, int], float] = {}
@@ -400,12 +441,18 @@ def detect_duplicate_subclip(
         for nn in range(I.shape[1]):
             fid = int(I[qi, nn])
             sim = float(D[qi, nn])
+
             if fid < 0:
                 continue
             if sim < CONFIG.cosine_threshold:
                 continue
 
-            cand_vid, cand_t = db.get_frame_meta(fid)
+            # Skip missing/tombstoned frames
+            try:
+                cand_vid, cand_t = db.get_frame_meta(fid)
+            except KeyError:
+                continue
+
             if cand_vid == video_id:
                 continue
 
@@ -422,13 +469,22 @@ def detect_duplicate_subclip(
     if not votes:
         return DuplicateDecision(False, note="no_votes")
 
-    ranked = sorted(votes.items(), key=lambda kv: (kv[1], best_sim[kv[0]]), reverse=True)[: CONFIG.top_candidates]
+    ranked = sorted(
+        votes.items(),
+        key=lambda kv: (kv[1], best_sim[kv[0]]),
+        reverse=True
+    )[: CONFIG.top_candidates]
+
     (cand_vid, ob), vcount = ranked[0]
     offset_seconds = ob * bin_size
-    logging.debug("Top candidate: %s offset≈%.2fs votes=%d best_sim=%.3f",
-                  cand_vid, offset_seconds, vcount, best_sim[(cand_vid, ob)])
 
-    # Lightweight contiguity verification:
+    logging.debug(
+        "Top candidate: %s offset≈%.2fs votes=%d best_sim=%.3f",
+        cand_vid, offset_seconds, vcount, best_sim[(cand_vid, ob)]
+    )
+
+    # Verification: this stage relies on frame lists for the candidate.
+    # If the candidate video was deleted, this should naturally be empty.
     cand_frames = db.get_frames_for_video(cand_vid)
     if not cand_frames:
         return DuplicateDecision(False, note="candidate_no_frames")
@@ -461,10 +517,12 @@ def detect_duplicate_subclip(
             jj = cj + dj
             if jj < 0 or jj >= len(cand_ids):
                 continue
-            aligned_fid = int(cand_ids[jj])
 
+            aligned_fid = int(cand_ids[jj])
             nbrs = I[qi]
             sims = D[qi]
+
+            # Note: this check is now over an oversampled neighbor list, which helps.
             for n in range(len(nbrs)):
                 if int(nbrs[n]) == aligned_fid and float(sims[n]) >= CONFIG.cosine_threshold:
                     matched = True
@@ -484,8 +542,10 @@ def detect_duplicate_subclip(
             run_score_sum = 0.0
 
     best_seconds = best_run * seconds_per_frame
-    logging.debug("Verification: best contiguous run=%d frames (≈%.2fs), avg_sim≈%.3f",
-                  best_run, best_seconds, best_avg)
+    logging.debug(
+        "Verification: best contiguous run=%d frames (≈%.2fs), avg_sim≈%.3f",
+        best_run, best_seconds, best_avg
+    )
 
     if best_seconds >= CONFIG.min_contiguous_seconds:
         note = f"match={cand_vid} offset≈{offset_seconds:.2f}s run≈{best_seconds:.2f}s"
@@ -499,6 +559,7 @@ def detect_duplicate_subclip(
         )
 
     return DuplicateDecision(False, note="verification_failed")
+
 
 
 #
@@ -606,6 +667,7 @@ def main() -> int:
     p.add_argument("--input", required=True, help="Directory containing videos OR a single video file path")
     p.add_argument("--db", required=True, help="SQLite DB path (metadata)")
     p.add_argument("--faiss", required=True, help="FAISS index path")
+    p.add_argument("--remove-deleted", action="store_true", help="Remove the database information about the videos deleted from disk")
     p.add_argument("--detect-duplicates", action="store_true", help="Detect duplicates/subclips and skip adding them")
     p.add_argument("--fps", type=float, default=3.0, help="Sampling FPS (default: 3)")
     p.add_argument("--ignore-first", type=float, default=20.0, help="Ignore first N seconds (default: 20)")
@@ -644,6 +706,10 @@ def main() -> int:
     logging.info("Found %d video(s).", len(videos))
 
     db = MetaDB(args.db)
+
+    if args.remove_deleted:
+        db.removeMissingVideos( videos )
+
     STATE.index = create_or_load_faiss( args.faiss )
     encoder = OpenCLIPEncoder()
 
