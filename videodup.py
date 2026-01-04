@@ -51,7 +51,7 @@ class Config:
     min_contiguous_seconds: float = 10.0
     jitter_frames: int = 1
     top_candidates: int = 10
-    move_dup_path : str = None
+    store_dups : str = None
     save_index_period : int = 100
 
     # FAISS HNSW
@@ -553,14 +553,11 @@ def process_video(
                 # Here you can add more logic what to do when a duplicate video is detected.
                 # decision.matched_video_id is the video ID (file name) of which the current video is duplicate of;
                 # path is the current video.
-                if CONFIG.move_dup_path != None:
-                    target_dir = f'{CONFIG.move_dup_path}/{decision.matched_video_id}'
-                    os.makedirs(target_dir, exist_ok=True)
-                    try:
-                        os.rename( path, f'{target_dir}/{vid}' )
+                if CONFIG.store_dups != None:
+                    with open( CONFIG.store_dups, "a+" ) as f:
+                        f.write( path + "\n" )
+                        f.write( decision.matched_video_id + "\n" )
                         return
-                    except Exception as e:
-                        logging.exception("ERROR moving %s: to %s: %s", vid, target_dir, str(e))
 
                 db.mark_video(vid, path, status="duplicate", duplicate_of=decision.matched_video_id, note=decision.note)
                 return
@@ -616,7 +613,7 @@ def main() -> int:
     p.add_argument("--cos", type=float, default=0.90, help="Cosine threshold (default: 0.90)")
     p.add_argument("--verbose", action="store_true", help="Enable debug logging")
     p.add_argument("--max-duration", type=int, default=0, help="Maximum number of seconds to base the fingerprint on (default: full video)")
-    p.add_argument("--move-duplicates-path", type=str, default=None, help="Move the detected duplicates into this path under the original subfolder")
+    p.add_argument("--store-dups", type=str, default=None, help="Store the duplicate file names in a specified file. Original file, LF, dup file")
     p.add_argument("--save-index-period", type=int, default=100, help="Save the FAISS index after each processed N videos (default: 100); 0 - only on exit")
     args = p.parse_args()
 
@@ -632,7 +629,7 @@ def main() -> int:
         detect_duplicates=args.detect_duplicates,
         knn_k=args.k,
         cosine_threshold=args.cos,
-        move_dup_path = args.move_duplicates_path,
+        store_dups = args.store_dups,
         save_index_period = args.save_index_period
     )
 
